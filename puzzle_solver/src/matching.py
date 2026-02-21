@@ -26,11 +26,28 @@ class ReferenceAnalyzer:
 class PieceMatcher:
     def __init__(self, reference_analyzer):
         self.ref = reference_analyzer
-        # Adjust norm based on detector
         if self.ref.detector_type == "ORB":
             self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         else:
             self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+
+        # Working copy of features (can be filtered iteratively)
+        self.current_keypoints = self.ref.keypoints
+        self.current_descriptors = self.ref.descriptors
+
+    def reset_features(self):
+        self.current_keypoints = self.ref.keypoints
+        self.current_descriptors = self.ref.descriptors
+
+    def update_features(self, valid_indices):
+        """
+        Updates the current keypoints and descriptors to only keep valid_indices.
+        """
+        if self.current_descriptors is None:
+            return
+            
+        self.current_keypoints = [self.current_keypoints[i] for i in valid_indices]
+        self.current_descriptors = self.current_descriptors[valid_indices]
         
     def match_piece(self, piece, min_matches=4): # Lowered threshold for debug
         """
@@ -60,7 +77,10 @@ class PieceMatcher:
         # 2. Match descriptors
         try:
             # k=2 for Ratio Test
-            matches = self.matcher.knnMatch(des_piece, self.ref.descriptors, k=2)
+            if self.current_descriptors is None or len(self.current_descriptors) < 2:
+                return False, None, {}
+                
+            matches = self.matcher.knnMatch(des_piece, self.current_descriptors, k=2)
         except cv2.error:
             # Fallback if types mismatch (e.g. SIFT vs ORB descriptor norms)
             return False, None, {}
@@ -83,22 +103,32 @@ class PieceMatcher:
         src_pts = np.float32([kp_piece[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         src_pts /= scale_factor # normalize back to original image coords
         
-        dst_pts = np.float32([self.ref.keypoints[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        # Use current_keypoints for destination
+        dst_pts = np.float32([self.current_keypoints[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        # Use Partial Affine (Rotation + Translation + Scale) instead of Homography
+        # This enforces rigidity and prevents perspective distortion (non-convex shapes)
+        M_affine, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
         
-        if M is None:
+        if M_affine is None:
             return False, None, {'matches': len(good_matches)}
+            
+        # Convert 2x3 Affine to 3x3 Homography for compatibility
+        M = np.vstack([M_affine, [0, 0, 1]])
+            
+        matches_mask = mask.ravel().tolist()
+        inliers_count = np.sum(mask)
 
         # 5. Color Verification
         # If matches are high enough, skip color check (expensive and robust enough)
         # Low match count warrants a check.
-        if len(good_matches) < 15:
-            if not self.verify_color(piece, M):
-                return False, None, {'matches': len(good_matches), 'color_verified': False}
+        if inliers_count < 10: # Check based on inliers, not raw matches
+             if not self.verify_color(piece, M):
+                return False, None, {'matches': len(good_matches), 'inliers': inliers_count, 'color_verified': False}
         
         return True, M, {
             'matches': len(good_matches),
+            'inliers': int(inliers_count),
             'good_matches': good_matches,
             'keypoints': kp_piece,
             'color_verified': True
