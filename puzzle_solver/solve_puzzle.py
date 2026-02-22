@@ -1,10 +1,8 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from src.image_processing import load_image
 from src.segmentation import PieceDetector
 from src.matching import ReferenceAnalyzer, PieceMatcher
-from src.utils import resize_image
 
 def draw_matches(ref_image, matches):
     """
@@ -47,7 +45,7 @@ def main():
     
     # 2. Segment Pieces
     print("Segmenting pieces...")
-    detector = PieceDetector(min_area=1000, max_area=100000) # Using default/tuned params
+    detector = PieceDetector() # Using robust grabcut defaults
     pieces = detector.detect_pieces(pieces_image)
     print(f"Found {len(pieces)} pieces.")
     

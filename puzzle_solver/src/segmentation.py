@@ -1,101 +1,127 @@
 import cv2
 import numpy as np
-from .utils import resize_image
 
 class PieceDetector:
-    def __init__(self, min_area=500, max_area=100000):
+    def __init__(self, min_area=400, max_area=100000):
         self.min_area = min_area
         self.max_area = max_area
 
     def detect_pieces(self, image):
         """
-        Detects puzzle pieces in the image.
+        Detects puzzle pieces in the image using a robust Two-Pass Localized Strategy.
         Returns a list of dictionaries, each containing:
-        - 'contour': The contour of the piece
+        - 'contour': The exact grabbed contour of the piece
         - 'bbox': Bounding box (x, y, w, h)
-        - 'image': Cropped image of the piece (with transparency/mask)
-        - 'mask': Binary mask of the piece
+        - 'image': Cropped image of the piece
+        - 'image_alpha': Cropped image of the piece with transparency
+        - 'mask': Binary localized mask of the piece
         - 'center': (cx, cy) center of the piece in original image
         """
-        # Preprocessing
-        blurred = cv2.GaussianBlur(image, (5, 5), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        # Pass 1: Global Crude Detection
+        gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred_img = cv2.GaussianBlur(gray_img, (5, 5), 0)
         
-        # 1. Background Color Removal (Wood)
-        # Based on optimization (DarkWood config): 
-        # Captures wood texture better including dark grain
-        lower_wood = np.array([5, 40, 20])    
-        upper_wood = np.array([30, 255, 180])
+        edges_img = cv2.Canny(blurred_img, 25, 100)
         
-        # Create mask of the wood table
-        bg_mask = cv2.inRange(hsv, lower_wood, upper_wood)
+        # Aggressively seal edges
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        crude_mask = cv2.morphologyEx(edges_img, cv2.MORPH_CLOSE, kernel, iterations=2)
         
-        # Invert to get pieces (foreground)
-        fg_mask = cv2.bitwise_not(bg_mask)
+        contours, _ = cv2.findContours(crude_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        # 2. Refine Foreground
-        # Remove small noise
-        kernel_small = np.ones((3,3), np.uint8)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_small, iterations=2)
+        # Pass 2: Statistical Outlier Rejection
+        candidate_contours = []
+        candidate_areas = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > self.min_area:
+                candidate_contours.append(cnt)
+                candidate_areas.append(area)
+                
+        if not candidate_areas:
+             return []
+             
+        median_area = np.median(candidate_areas)
+        lower_bound = median_area * 0.5
+        upper_bound = median_area * 1.5
         
-        # Aggressive closing to fill holes in pieces
-        kernel_large = np.ones((7,7), np.uint8)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_large, iterations=4)
-        
-        # 3. Initial Contour Detection
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        valid_contours = []
-        areas = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if self.min_area < area < self.max_area:
-                valid_contours.append(contour)
-                areas.append(area)
-        
-        if not areas:
-            return []
-            
+        filtered_crude_contours = []
+        for cnt in candidate_contours:
+            if lower_bound < cv2.contourArea(cnt) < upper_bound:
+                filtered_crude_contours.append(cnt)
+                
+        # Pass 3: Dynamically Localized Piece Refinement (GrabCut)
         pieces = []
-        for contour in valid_contours:
-            # Just extract the piece directly without splitting
-            pieces.append(self._extract_piece(image, contour))
+        h_full, w_full = image.shape[:2]
+        m_pad = 10 
         
+        for crude_cnt in filtered_crude_contours:
+            x, y, w, h = cv2.boundingRect(crude_cnt)
+            
+            x_start = max(0, x - m_pad)
+            y_start = max(0, y - m_pad)
+            x_end = min(w_full, x + w + m_pad)
+            y_end = min(h_full, y + h + m_pad)
+            
+            patch_w = x_end - x_start
+            patch_h = y_end - y_start
+            
+            patch_rgb = image[y_start:y_end, x_start:x_end]
+            
+            mask = np.zeros((patch_h, patch_w), np.uint8)
+            bgdModel = np.zeros((1,65), np.float64)
+            fgdModel = np.zeros((1,65), np.float64)
+            
+            # 2 pixels border as sure background
+            rect = (2, 2, patch_w - 4, patch_h - 4)
+            
+            # Only run GrabCut if rect is valid
+            if patch_w <= 4 or patch_h <= 4:
+                continue
+                
+            cv2.grabCut(patch_rgb, mask, rect, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_RECT)
+            grabcut_mask = np.where((mask==2)|(mask==0), 0, 1).astype('uint8')
+            
+            pc_cnts, _ = cv2.findContours(grabcut_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if pc_cnts:
+                exact_cnt_local = max(pc_cnts, key=cv2.contourArea)
+                
+                # Check area again to avoid weird grabcut artifacts
+                if cv2.contourArea(exact_cnt_local) < self.min_area:
+                    continue
+                    
+                exact_cnt_global = exact_cnt_local + [x_start, y_start]
+                pieces.append(self._extract_refined_piece(image, exact_cnt_global, grabcut_mask, x_start, y_start, patch_w, patch_h))
+                
         return pieces
 
-    def _extract_piece(self, image, contour):
-        x, y, w, h = cv2.boundingRect(contour)
+    def _extract_refined_piece(self, image, global_contour, local_mask, x_start, y_start, patch_w, patch_h):
+        # Cropped image from the exact bounding box of the final local contour
+        lx, ly, lw, lh = cv2.boundingRect(global_contour - [x_start, y_start])
         
-        # Extract the piece with some padding
-        pad = 5
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(image.shape[1], x + w + pad)
-        y2 = min(image.shape[0], y + h + pad)
+        # Original piece image segment securely bounds
+        piece_img = image[y_start + ly : y_start + ly + lh, x_start + lx : x_start + lx + lw].copy()
         
-        piece_img = image[y1:y2, x1:x2].copy()
+        local_mask_alpha = local_mask * 255
+        piece_mask = local_mask_alpha[ly : ly + lh, lx : lx + lw].copy()
         
-        # Create a clean mask
-        mask = np.zeros(image.shape[:2], dtype=np.uint8)
-        cv2.drawContours(mask, [contour], -1, 255, -1)
-        piece_mask = mask[y1:y2, x1:x2].copy()
-        
-        # Apply mask to alpha channel
         b, g, r = cv2.split(piece_img)
         rgba = [b, g, r, piece_mask]
         piece_with_alpha = cv2.merge(rgba, 4)
-
-        # Calculate center
-        M = cv2.moments(contour)
+        
+        gx, gy, gw, gh = cv2.boundingRect(global_contour)
+        
+        M = cv2.moments(global_contour)
         if M["m00"] != 0:
             cX = int(M["m10"] / M["m00"])
             cY = int(M["m01"] / M["m00"])
         else:
-            cX, cY = x + w // 2, y + h // 2
-
+            cX, cY = gx + gw // 2, gy + gh // 2
+            
         return {
-            'contour': contour,
-            'bbox': (x, y, w, h),
+            'contour': global_contour,
+            'bbox': (gx, gy, gw, gh),
             'image': piece_img,
             'image_alpha': piece_with_alpha,
             'mask': piece_mask,
