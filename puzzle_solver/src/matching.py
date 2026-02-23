@@ -13,7 +13,7 @@ class ReferenceAnalyzer:
         # SIFT is patent-expired and available in main opencv build since 4.4.0
         # If not available, use ORB.
         try:
-            self.detector = cv2.SIFT_create()
+            self.detector = cv2.SIFT_create(nfeatures=50000, contrastThreshold=0.005, edgeThreshold=20)
             self.detector_type = "SIFT"
         except AttributeError:
             self.detector = cv2.ORB_create(nfeatures=5000)
@@ -57,16 +57,17 @@ class PieceMatcher:
         - transform_matrix (3x3 homography or None)
         - visualization_data (dict)
         """
-        # Upscale piece to improve feature detection on small crops
         piece_img = piece['image']
-        # Pieces might be small (~50x50), upscaling helps SIFT
-        scale_factor = 2.0
+        
+        # SIFT works best with larger pixel footprints; scale up the small piece crops
+        scale_factor = 3.0
         piece_img_large = cv2.resize(piece_img, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
         gray_piece = cv2.cvtColor(piece_img_large, cv2.COLOR_BGR2GRAY)
         
-        # We need to scale the mask too if we use it
+        # Dilate mask slightly to capture edge features natively
         mask_large = cv2.resize(piece['mask'], None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
-        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        mask_large = cv2.dilate(mask_large, kernel, iterations=1)
         
         kp_piece, des_piece = self.ref.detector.detectAndCompute(gray_piece, mask=mask_large)
         # print(f"DEBUG: Piece descriptors found: {len(des_piece) if des_piece is not None else 0}")
@@ -86,35 +87,27 @@ class PieceMatcher:
             return False, None, {}
 
         # 3. Ratio Test
-        # Relaxed slightly to 0.8 to allow more candidates for RANSAC
+        # Relaxed slightly to 0.95 to allow more candidates for RANSAC
         good_matches = []
         for m, n in matches:
-            if m.distance < 0.8 * n.distance:
+            if m.distance < 0.95 * n.distance:
                 good_matches.append(m)
 
         if len(good_matches) < min_matches:
             return False, None, {'matches': len(good_matches)}
 
         # 4. Homography with RANSAC
-        # Note: piece keypoints are in upscaled coordinates.
-        # We need to scale them back? Or just let Homography handle it (it maps src->dst).
-        # We prefer to map the ORIGINAL piece to ref. 
-        # So we should scale keypoints down by scale_factor.
         src_pts = np.float32([kp_piece[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        src_pts /= scale_factor # normalize back to original image coords
+        src_pts /= scale_factor
         
         # Use current_keypoints for destination
         dst_pts = np.float32([self.current_keypoints[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
 
-        # Use Partial Affine (Rotation + Translation + Scale) instead of Homography
-        # This enforces rigidity and prevents perspective distortion (non-convex shapes)
-        M_affine, mask = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
+        # Use Homography with RANSAC to allow mapping perspective changes seamlessly
+        H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 10.0)
         
-        if M_affine is None:
+        if H is None:
             return False, None, {'matches': len(good_matches)}
-            
-        # Convert 2x3 Affine to 3x3 Homography for compatibility
-        M = np.vstack([M_affine, [0, 0, 1]])
             
         matches_mask = mask.ravel().tolist()
         inliers_count = np.sum(mask)
@@ -123,10 +116,10 @@ class PieceMatcher:
         # If matches are high enough, skip color check (expensive and robust enough)
         # Low match count warrants a check.
         if inliers_count < 10: # Check based on inliers, not raw matches
-             if not self.verify_color(piece, M):
+             if not self.verify_color(piece, H):
                 return False, None, {'matches': len(good_matches), 'inliers': inliers_count, 'color_verified': False}
         
-        return True, M, {
+        return True, H, {
             'matches': len(good_matches),
             'inliers': int(inliers_count),
             'good_matches': good_matches,

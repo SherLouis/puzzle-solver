@@ -37,15 +37,76 @@ def draw_matches(ref_image, matches):
             
     return output
 
+def overlay_piece(bg_img, piece_alpha, H):
+    h_bg, w_bg = bg_img.shape[:2]
+    h_p, w_p = piece_alpha.shape[:2]
+    
+    # Warp the piece image (4 channels)
+    warped_piece = cv2.warpPerspective(piece_alpha, H, (w_bg, h_bg))
+    
+    # Extract alpha mask
+    alpha = warped_piece[:, :, 3] / 255.0
+    
+    # Overlay
+    for c in range(3):
+        bg_img[:, :, c] = (alpha * warped_piece[:, :, c] + (1 - alpha) * bg_img[:, :, c]).astype(np.uint8)
+        
+    return bg_img
+
+def polygons_overlap(H1, H2, shape1, shape2):
+    # Check if two placed pieces overlap significantly
+    h1, w1 = shape1[:2]
+    h2, w2 = shape2[:2]
+    
+    pts1 = np.float32([[0,0], [0,h1], [w1,h1], [w1,0]]).reshape(-1,1,2)
+    pts2 = np.float32([[0,0], [0,h2], [w2,h2], [w2,0]]).reshape(-1,1,2)
+    
+    dst1 = cv2.perspectiveTransform(pts1, H1)
+    dst2 = cv2.perspectiveTransform(pts2, H2)
+    
+    # Create masks and calculate intersection
+    # Just checking bounding box intersection first for speed
+    rect1 = cv2.boundingRect(np.int32(dst1))
+    rect2 = cv2.boundingRect(np.int32(dst2))
+    
+    # rect is x, y, w, h
+    x1, y1, w1, h1 = rect1
+    x2, y2, w2, h2 = rect2
+    
+    if x1 + w1 < x2 or x2 + w2 < x1 or y1 + h1 < y2 or y2 + h2 < y1:
+        return False # No bbox overlap
+        
+    # Calculate more exact overlap area if bbox overlaps
+    # Create simple binary masks
+    mask1 = np.zeros((1000, 1000), dtype=np.uint8) # Arbitrary large enough size, or max of rects
+    # Actually, proper way is polygon intersection area, but let's just use shapely or opencv
+    # For simplicity, we can just say if centers are too close or bounding rects overlap significantly
+    
+    overlap_x = max(0, min(x1 + w1, x2 + w2) - max(x1, x2))
+    overlap_y = max(0, min(y1 + h1, y2 + h2) - max(y1, y2))
+    overlap_area = overlap_x * overlap_y
+    
+    area1 = w1 * h1
+    area2 = w2 * h2
+    
+    # If overlap is more than 30% of either piece
+    if overlap_area > 0.3 * min(area1, area2):
+        return True
+    return False
+
 def main():
     # 1. Load Images
     print("Loading images...")
-    box_image = load_image('puzzle_solver/data/box.jpg')
-    pieces_image = load_image('puzzle_solver/data/pieces.jpg')
+    try:
+        box_image = load_image('data/box.jpg')
+        pieces_image = load_image('data/pieces.jpg')
+    except Exception:
+        box_image = load_image('puzzle_solver/data/box.jpg')
+        pieces_image = load_image('puzzle_solver/data/pieces.jpg')
     
     # 2. Segment Pieces
     print("Segmenting pieces...")
-    detector = PieceDetector() # Using robust grabcut defaults
+    detector = PieceDetector()
     pieces = detector.detect_pieces(pieces_image)
     print(f"Found {len(pieces)} pieces.")
     
@@ -55,137 +116,229 @@ def main():
     kp, des = ref_analyzer.compute_features()
     print(f"Reference features: {len(kp)}")
     
-    # 4. Match Pieces
-    print("Matching pieces (Iterative)...")
+    # 4. Match Pieces (Independent)
+    print("Matching pieces independently...")
     matcher = PieceMatcher(ref_analyzer)
     
-    unmatched_pieces = [i for i in range(len(pieces))]
+    all_matches = []
+    
+    for idx, piece in enumerate(pieces):
+        # Reset features for each piece so they all match against the full reference
+        matcher.reset_features()
+        success, H, info = matcher.match_piece(piece, min_matches=6)
+        
+        if success:
+            inliers = info.get('inliers', 0)
+            
+            # 2b. Geometric Verification (Scale and Distortion)
+            h, w = piece['image'].shape[:2]
+            pts = np.float32([[0,0], [0,h], [w,h], [w,0]]).reshape(-1,1,2)
+            dst_pts = cv2.perspectiveTransform(pts, H)
+            
+            # Validate geometric distortion rigorously
+            invalid_geometry = False
+            for pt in dst_pts:
+                # Sanity bounds check
+                if pt[0][0] < -5000 or pt[0][0] > 10000 or pt[0][1] < -5000 or pt[0][1] > 10000:
+                    invalid_geometry = True
+                    break
+            
+            if invalid_geometry: continue
+            
+            piece_area = w * h
+            dst_area = cv2.contourArea(dst_pts)
+            if piece_area == 0: continue
+            scale_ratio = dst_area / piece_area
+            
+            # Tighter scale constraint - puzzles shouldn't scale drastically
+            if scale_ratio < 1.0 or scale_ratio > 10.0:
+                continue
+                
+            if not cv2.isContourConvex(np.int32(dst_pts)):
+                continue
+                
+            # Check aspect ratio distortion
+            rect = cv2.minAreaRect(dst_pts)
+            rw, rh = rect[1]
+            if rw == 0 or rh == 0: continue
+            ratio = max(rw/rh, rh/rw)
+            if ratio > 3.0: continue # Pieces shouldn't become long rectangles
+            
+            if inliers >= 5:
+                all_matches.append({
+                    'piece_idx': idx,
+                    'piece': piece,
+                    'H': H,
+                    'inliers': inliers,
+                    'scale': scale_ratio
+                })
+                print(f"Piece {idx} broadly matched! Inliers: {inliers}, Scale: {scale_ratio:.2f}")
+
+    # 5. Non-Maximum Suppression (Sort by inliers)
+    print("\nResolving overlapping matches...")
+    all_matches.sort(key=lambda x: x['inliers'], reverse=True)
+    
     final_matches = []
     
-    # Mask to track occupied areas (visual only)
-    ref_h, ref_w = ref_analyzer.reference_image.shape[:2]
-    occupied_mask = np.zeros((ref_h, ref_w), dtype=np.uint8)
-    
-    iteration = 0
-    max_iterations = len(pieces) + 5 # Safety limit
-    
-    while unmatched_pieces and iteration < max_iterations:
-        print(f"\nIteration {iteration}: Matching {len(unmatched_pieces)} pieces against {len(matcher.current_keypoints)} features...")
-        iteration += 1
+    for match in all_matches:
+        idx = match['piece_idx']
+        H = match['H']
+        piece = match['piece']
         
-        best_match = None
-        best_score = -1
-        best_idx = -1
+        # Check against already placed pieces
+        overlaps = False
+        for placed in final_matches:
+            if polygons_overlap(H, placed['H'], piece['image'].shape, placed['piece']['image'].shape):
+                overlaps = True
+                break
+                
+        if not overlaps:
+            final_matches.append(match)
+            print(f"Placed Piece {idx} with {match['inliers']} inliers.")
+        else:
+            print(f"Discarded Piece {idx} due to overlap.")
+            
+    print(f"\nMatch complete. Found {len(final_matches)} solid unique placements.")
+    
+    # 6. Build the Recursive Assembled Canvas!
+    print("\n--- Assembling Puzzle ---")
+    h_bg, w_bg = ref_analyzer.reference_image.shape[:2]
+    canvas_h, canvas_w = h_bg * 3, w_bg * 3
+    
+    # We create a dark solid canvas dynamically sized
+    canvas = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 30
+    
+    # Because pieces can map structurally off the edges of the limited reference box cover,
+    # we explicitly place 'data/box.jpg' in the direct center of the large canvas natively.
+    offset_y, offset_x = h_bg, w_bg
+    T = np.array([[1, 0, offset_x], [0, 1, offset_y], [0, 0, 1]], dtype=np.float64)
+    
+    canvas[offset_y:offset_y+h_bg, offset_x:offset_x+w_bg] = ref_analyzer.reference_image
+    
+    placed_matches = []
+    
+    for match in final_matches:
+        idx = match['piece_idx']
+        piece = match['piece']
+        H = match['H']
         
-        # 1. Match all remaining pieces
-        for idx in unmatched_pieces:
+        # Shift Homography to translated native Canvas
+        H_shifted = T @ H
+        canvas = overlay_piece(canvas, piece['image_alpha'], H_shifted)
+        match['H'] = H_shifted
+        placed_matches.append(match)
+        
+    cv2.imwrite('assembled_step_0.jpg', canvas)
+    
+    unmatched_indices = [i for i in range(len(pieces)) if i not in [m['piece_idx'] for m in placed_matches]]
+    
+    iteration = 1
+    max_assemble_iters = 5
+    
+    while unmatched_indices and iteration <= max_assemble_iters:
+        print(f"\nAssembly Iteration {iteration}: {len(unmatched_indices)} pieces left...")
+        
+        # 7. Feed the newly structurally synthesized canvas back into the solver as the Reference Map!!
+        canvas_analyzer = ReferenceAnalyzer(canvas)
+        canvas_analyzer.compute_features()
+        canvas_matcher = PieceMatcher(canvas_analyzer)
+        print(f"Total Structural Canvas features: {len(canvas_analyzer.keypoints)}")
+        
+        newly_placed = []
+        
+        for idx in unmatched_indices:
             piece = pieces[idx]
-            success, H, info = matcher.match_piece(piece)
+            canvas_matcher.reset_features()
+            # Match directly onto the blended visual edges!
+            success, H_shifted, info = canvas_matcher.match_piece(piece, min_matches=6)
             
             if success:
-                score = info.get('inliers', 0)
-                # Prioritize strictly higher score
-                if score > best_score:
-                    best_score = score
-                    best_match = (idx, piece, H, info)
+                inliers = info.get('inliers', 0)
+                
+                h, w = piece['image'].shape[:2]
+                pts = np.float32([[0,0], [0,h], [w,h], [w,0]]).reshape(-1,1,2)
+                dst_pts = cv2.perspectiveTransform(pts, H_shifted)
+                
+                # Validate geometric distortion rigorously
+                invalid_geometry = False
+                for pt in dst_pts:
+                    # Sanity bounds check
+                    if pt[0][0] < -5000 or pt[0][0] > 10000 or pt[0][1] < -5000 or pt[0][1] > 10000:
+                        invalid_geometry = True
+                        break
+                
+                if invalid_geometry: continue
+                
+                piece_area = w * h
+                dst_area = cv2.contourArea(dst_pts)
+                if piece_area == 0: continue
+                scale_ratio = dst_area / piece_area
+                
+                    
+                # Strict color geometric evaluation evaluating overlap bounding maps 
+                h_ref, w_ref = canvas.shape[:2]
+                piece_mask = piece['mask']
+                warped_mask = cv2.warpPerspective(piece_mask, H_shifted, (w_ref, h_ref))
+                
+                # Exclude mapping into empty space directly exclusively
+                intersection_canvas = cv2.bitwise_and(canvas[:,:,0], canvas[:,:,0], mask=warped_mask)
+                non_empty = cv2.countNonZero(intersection_canvas)
+                
+                # Ensure the bound connects computationally
+                if non_empty < 0.1 * piece_area:
+                    continue
+                if not cv2.isContourConvex(np.int32(dst_pts)):
+                    continue
+                    
+                # Check aspect ratio distortion
+                rect = cv2.minAreaRect(dst_pts)
+                rw, rh = rect[1]
+                if rw == 0 or rh == 0: continue
+                ratio = max(rw/rh, rh/rw)
+                if ratio > 3.0: continue # Pieces shouldn't become long rectangles
+                    
+                if inliers >= 8: # Confidence bounding
+                    newly_placed.append({
+                        'piece_idx': idx,
+                        'piece': piece,
+                        'H': H_shifted,
+                        'inliers': inliers,
+                        'scale': scale_ratio
+                    })
+                    print(f"Piece {idx} structurally matched to Canvas Edge! Inliers: {inliers}, Scale: {scale_ratio:.2f}")
+
+        # NMS on strictly new matches
+        newly_placed.sort(key=lambda x: x['inliers'], reverse=True)
         
-        # 2. Check if we found ANY match
-        if best_match is None or best_score < 4: # Min inliers threshold
-            print("No more valid matches found.")
+        placed_this_round = 0
+        for match in newly_placed:
+            idx = match['piece_idx']
+            H = match['H']
+            piece = match['piece']
+            
+            overlaps = False
+            for placed in placed_matches:
+                if polygons_overlap(H, placed['H'], piece['image'].shape, placed['piece']['image'].shape):
+                    overlaps = True
+                    break
+                    
+            if not overlaps:
+                placed_matches.append(match)
+                canvas = overlay_piece(canvas, piece['image_alpha'], H)
+                unmatched_indices.remove(idx)
+                placed_this_round += 1
+                print(f"Placed Piece {idx} stably with {match['inliers']} inliers onto Canvas.")
+            
+        cv2.imwrite(f'assembled_step_{iteration}.jpg', canvas)
+        if placed_this_round == 0:
+            print("Mathematical deadlock limit reached. No native pieces matched further.")
             break
             
-        idx, piece, H, info = best_match
-        
-        # 2b. Geometric Verification (Scale and Distortion)
-        # Decompose homography to check scale
-        # Simple check: Map corners and check area ratio
-        h, w = piece['image'].shape[:2]
-        pts = np.float32([[0,0], [0,h], [w,h], [w,0]]).reshape(-1,1,2)
-        dst_pts = cv2.perspectiveTransform(pts, H)
-        
-        # Check area
-        piece_area = w * h
-        dst_area = cv2.contourArea(dst_pts)
-        
-        if piece_area == 0: scale_ratio = 0
-        else: scale_ratio = dst_area / piece_area
-        
-        # Valid scale: Piece shouldn't grow > 4x or shrink < 0.25x
-        # Unless reference is much larger. 
-        # Ref image is ~1000px wide. Piece is ~50px.
-        # Scale should be roughly consistent.
-        # Let's assume consistent scale across all matches.
-        # But for now, just filter extreme nonsense.
-        if scale_ratio < 0.1 or scale_ratio > 10.0:
-            print(f"  -> Rejected Piece {idx} (Score: {best_score}): Invalid Scale {scale_ratio:.2f}")
-            unmatched_pieces.remove(idx) # Don't try again? Or just temporary skip?
-            # If we remove it, we won't try it again. True.
-            continue
+        iteration += 1
 
-        # Check convexity / distortion
-        if not cv2.isContourConvex(np.int32(dst_pts)):
-             print(f"  -> Rejected Piece {idx} (Score: {best_score}): Non-convex shape")
-             unmatched_pieces.remove(idx)
-             continue
-
-        print(f"  -> Accepted Piece {idx} (Score: {best_score}) Scale: {scale_ratio:.2f}")
-        final_matches.append((piece, H))
-        unmatched_pieces.remove(idx)
-        
-        # 3. Remove used features from Reference (Masking)
-        # Use Mask based removal for robustness
-        removal_mask = np.zeros((ref_h, ref_w), dtype=np.uint8)
-        cv2.fillConvexPoly(removal_mask, np.int32(dst_pts), 255)
-        
-        # Filter keypoints using mask
-        valid_indices = []
-        removed_count = 0
-        
-        # Vectorized check if possible?
-        # matcher.current_keypoints is a list.
-        # We can perform batch lookup if we convert to points.
-        # But python loop is okay for 2000 points.
-        
-        kp_points = cv2.KeyPoint_convert(matcher.current_keypoints)
-        if len(kp_points) > 0:
-            kp_int = np.int32(kp_points)
-            # Clip coordinates to image bounds
-            kp_int[:, 0] = np.clip(kp_int[:, 0], 0, ref_w - 1)
-            kp_int[:, 1] = np.clip(kp_int[:, 1], 0, ref_h - 1)
-            
-            # Sample the mask
-            mask_values = removal_mask[kp_int[:, 1], kp_int[:, 0]]
-            
-            # Keep indices where mask is 0
-            valid_indices = np.where(mask_values == 0)[0].tolist()
-            removed_count = len(matcher.current_keypoints) - len(valid_indices)
-
-        print(f"  -> Removed {removed_count} features covered by Piece {idx}")
-        matcher.update_features(valid_indices)
-        
-        # If too few features left, break
-        if len(matcher.current_keypoints) < 5:
-            print("Reference features exhausted.")
-            break
-
-    print(f"\nMatch complete. Found {len(final_matches)} unique placements.")
-    
-    # Draw matches
-    result_img = ref_analyzer.reference_image.copy()
-    for piece, H in final_matches:
-        h, w = piece['image'].shape[:2]
-        pts = np.float32([[0, 0], [0, h], [w, h], [w, 0]]).reshape(-1, 1, 2)
-        dst = cv2.perspectiveTransform(pts, H)
-        cv2.polylines(result_img, [np.int32(dst)], True, (0, 255, 0), 3)
-        M_moments = cv2.moments(np.int32(dst))
-        if M_moments['m00'] != 0:
-            cx = int(M_moments['m10'] / M_moments['m00'])
-            cy = int(M_moments['m01'] / M_moments['m00'])
-            cv2.putText(result_img, "P", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-            
-    cv2.imwrite('solution_result.jpg', result_img)
-    print("Saved solution result to 'solution_result.jpg'.")
-
+    print(f"\nAssembly process recursively complete. Placed {len(placed_matches)} / {len(pieces)} uniquely bound shapes.")
+    cv2.imwrite('solution_assembled.jpg', canvas)
+    print("Saved fully assembled robust output to 'solution_assembled.jpg'.")
 
 if __name__ == "__main__":
     main()
