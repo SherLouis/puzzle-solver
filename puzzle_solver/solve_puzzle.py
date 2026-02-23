@@ -108,7 +108,10 @@ def main():
     print("Segmenting pieces...")
     detector = PieceDetector()
     pieces = detector.detect_pieces(pieces_image)
-    print(f"Found {len(pieces)} pieces.")
+    counts = {'interior': 0, 'edge': 0, 'corner': 0}
+    for p in pieces:
+        counts[p.get('type', 'interior')] += 1
+    print(f"Found {len(pieces)} pieces: {counts['corner']} corners, {counts['edge']} edges, {counts['interior']} interior.")
     
     # 3. Analyze Reference
     print("Analyzing reference...")
@@ -172,7 +175,7 @@ def main():
                     'inliers': inliers,
                     'scale': scale_ratio
                 })
-                print(f"Piece {idx} broadly matched! Inliers: {inliers}, Scale: {scale_ratio:.2f}")
+                print(f"Piece {idx} ({piece.get('type', 'interior')}) broadly matched! Inliers: {inliers}, Scale: {scale_ratio:.2f}")
 
     # 5. Non-Maximum Suppression (Sort by inliers)
     print("\nResolving overlapping matches...")
@@ -213,7 +216,8 @@ def main():
     offset_y, offset_x = h_bg, w_bg
     T = np.array([[1, 0, offset_x], [0, 1, offset_y], [0, 0, 1]], dtype=np.float64)
     
-    canvas[offset_y:offset_y+h_bg, offset_x:offset_x+w_bg] = ref_analyzer.reference_image
+    # User Request: Final output is also saved without mapping on the box cover
+    # canvas[offset_y:offset_y+h_bg, offset_x:offset_x+w_bg] = ref_analyzer.reference_image
     
     placed_matches = []
     
